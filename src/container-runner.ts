@@ -26,6 +26,7 @@ import {
   stopContainer,
 } from './container-runtime.js';
 import { detectAuthMode } from './credential-proxy.js';
+import { readEnvFile } from './env.js';
 import { validateAdditionalMounts } from './mount-security.js';
 import { RegisteredGroup } from './types.js';
 
@@ -42,6 +43,7 @@ export interface ContainerInput {
   isScheduledTask?: boolean;
   assistantName?: string;
   script?: string;
+  imageAttachments?: Array<{ relativePath: string; mediaType: string }>;
 }
 
 export interface ContainerOutput {
@@ -255,6 +257,16 @@ function buildContainerArgs(
     args.push('-e', 'ANTHROPIC_API_KEY=placeholder');
   } else {
     args.push('-e', 'CLAUDE_CODE_OAUTH_TOKEN=placeholder');
+  }
+
+  // Forward OpenRouter API key (if set) so MCP tools that call OpenRouter
+  // (e.g. generate_image → Nano Banana) can authenticate. Unlike Anthropic,
+  // OpenRouter traffic bypasses the credential proxy.
+  const orKey =
+    readEnvFile(['OPENROUTER_API_KEY']).OPENROUTER_API_KEY ||
+    process.env.OPENROUTER_API_KEY;
+  if (orKey) {
+    args.push('-e', `OPENROUTER_API_KEY=${orKey}`);
   }
 
   // Runtime-specific args for host gateway resolution

@@ -29,6 +29,16 @@ vi.mock('../group-folder.js', () => ({
   resolveGroupFolderPath: vi.fn((folder: string) => `/tmp/test-groups/${folder}`),
 }));
 
+// Mock sharp (used by processImage for photo handling)
+vi.mock('sharp', () => {
+  const mockSharp = vi.fn(() => ({
+    resize: vi.fn().mockReturnThis(),
+    jpeg: vi.fn().mockReturnThis(),
+    toBuffer: vi.fn().mockResolvedValue(Buffer.from('resized-image-data')),
+  }));
+  return { default: mockSharp };
+});
+
 
 // --- Grammy mock ---
 
@@ -672,7 +682,7 @@ describe('TelegramChannel', () => {
   // --- Non-text messages ---
 
   describe('non-text messages', () => {
-    it('downloads photo and includes path in content', async () => {
+    it('downloads photo and emits an [Image: ...] content ref', async () => {
       const opts = createTestOpts();
       const channel = new TelegramChannel('test-token', opts);
       await channel.connect();
@@ -683,16 +693,18 @@ describe('TelegramChannel', () => {
       await triggerMediaMessage('message:photo', ctx);
       await flushPromises();
 
+      // Largest photo is picked
       expect(currentBot().api.getFile).toHaveBeenCalledWith('large_id');
+      // Photo path runs through processImage → [Image: attachments/img-<ts>-<rand>.jpg]
       expect(opts.onMessage).toHaveBeenCalledWith(
         'tg:100200300',
         expect.objectContaining({
-          content: '[Photo] (/workspace/group/attachments/photo_1.jpg)',
+          content: expect.stringMatching(/^\[Image: attachments\/img-\d+-[a-z0-9]+\.jpg\]$/),
         }),
       );
     });
 
-    it('downloads photo with caption', async () => {
+    it('downloads photo with caption and appends the caption to the image ref', async () => {
       const opts = createTestOpts();
       const channel = new TelegramChannel('test-token', opts);
       await channel.connect();
@@ -707,7 +719,7 @@ describe('TelegramChannel', () => {
       expect(opts.onMessage).toHaveBeenCalledWith(
         'tg:100200300',
         expect.objectContaining({
-          content: '[Photo] (/workspace/group/attachments/photo_1.jpg) Look at this',
+          content: expect.stringMatching(/^\[Image: attachments\/img-\d+-[a-z0-9]+\.jpg\] Look at this$/),
         }),
       );
     });

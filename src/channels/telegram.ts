@@ -2,11 +2,12 @@ import fs from 'fs';
 import https from 'https';
 import path from 'path';
 
-import { Api, Bot } from 'grammy';
+import { Api, Bot, InputFile } from 'grammy';
 
 import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
 import { readEnvFile } from '../env.js';
 import { resolveGroupFolderPath } from '../group-folder.js';
+import { processImage } from '../image.js';
 import { logger } from '../logger.js';
 import { registerChannel, ChannelOpts } from './registry.js';
 import {
@@ -78,7 +79,15 @@ export class TelegramChannel implements Channel {
 
       const groupDir = resolveGroupFolderPath(groupFolder);
       const attachDir = path.join(groupDir, 'attachments');
+      const attachDirExisted = fs.existsSync(attachDir);
       fs.mkdirSync(attachDir, { recursive: true });
+      if (!attachDirExisted && process.getuid?.() === 0) {
+        try {
+          fs.chownSync(attachDir, 1000, 1000);
+        } catch {
+          /* best effort */
+        }
+      }
 
       // Sanitize filename and add extension from Telegram's file_path if missing
       const tgExt = path.extname(file.file_path);
@@ -96,6 +105,13 @@ export class TelegramChannel implements Channel {
 
       const buffer = Buffer.from(await resp.arrayBuffer());
       fs.writeFileSync(destPath, buffer);
+      if (process.getuid?.() === 0) {
+        try {
+          fs.chownSync(destPath, 1000, 1000);
+        } catch {
+          /* best effort */
+        }
+      }
 
       logger.info({ fileId, dest: destPath }, 'Telegram file downloaded');
       return `/workspace/group/attachments/${finalName}`;
@@ -293,14 +309,73 @@ export class TelegramChannel implements Channel {
       deliver(`${placeholder}${caption}`);
     };
 
-    this.bot.on('message:photo', (ctx) => {
+    this.bot.on('message:photo', async (ctx) => {
       // Telegram sends multiple sizes; last is largest
       const photos = ctx.message.photo;
       const largest = photos?.[photos.length - 1];
-      storeMedia(ctx, '[Photo]', {
-        fileId: largest?.file_id,
-        filename: `photo_${ctx.message.message_id}`,
-      });
+      const fileId = largest?.file_id;
+
+      const chatJid = `tg:${ctx.chat.id}`;
+      const group = this.opts.registeredGroups()[chatJid];
+      if (!group) return;
+
+      const timestamp = new Date(ctx.message.date * 1000).toISOString();
+      const senderName =
+        ctx.from?.first_name ||
+        ctx.from?.username ||
+        ctx.from?.id?.toString() ||
+        'Unknown';
+      const caption = ctx.message.caption ?? '';
+
+      const isGroup =
+        ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
+      this.opts.onChatMetadata(
+        chatJid,
+        timestamp,
+        undefined,
+        'telegram',
+        isGroup,
+      );
+
+      const deliver = (content: string) => {
+        this.opts.onMessage(chatJid, {
+          id: ctx.message.message_id.toString(),
+          chat_jid: chatJid,
+          sender: ctx.from?.id?.toString() || '',
+          sender_name: senderName,
+          content,
+          timestamp,
+          is_from_me: false,
+        });
+      };
+
+      // Fetch the photo buffer from Telegram and hand it to processImage,
+      // which resizes, saves to <group>/attachments/, and returns the
+      // [Image: attachments/...] content string that the orchestrator's
+      // parseImageReferences() picks up as a multimodal attachment.
+      if (!fileId) {
+        deliver(caption ? `[Photo] ${caption}` : '[Photo]');
+        return;
+      }
+      try {
+        const file = await this.bot!.api.getFile(fileId);
+        if (!file.file_path) throw new Error('no file_path in getFile response');
+        const fileUrl = `https://api.telegram.org/file/bot${this.botToken}/${file.file_path}`;
+        const resp = await fetch(fileUrl);
+        if (!resp.ok) throw new Error(`download HTTP ${resp.status}`);
+        const buffer = Buffer.from(await resp.arrayBuffer());
+
+        const groupDir = resolveGroupFolderPath(group.folder);
+        const result = await processImage(buffer, groupDir, caption);
+        if (result) {
+          deliver(result.content);
+        } else {
+          deliver(caption ? `[Photo] ${caption}` : '[Photo]');
+        }
+      } catch (err) {
+        logger.warn({ err, chatJid }, 'Telegram photo processing failed');
+        deliver(caption ? `[Photo] ${caption}` : '[Photo]');
+      }
     });
     this.bot.on('message:video', (ctx) => {
       storeMedia(ctx, '[Video]', {
@@ -411,6 +486,29 @@ export class TelegramChannel implements Channel {
       this.bot.stop();
       this.bot = null;
       logger.info('Telegram bot stopped');
+    }
+  }
+
+  async sendPhoto(
+    jid: string,
+    filePath: string,
+    caption?: string,
+  ): Promise<void> {
+    if (!this.bot) {
+      logger.warn('Telegram bot not initialized');
+      return;
+    }
+    try {
+      const numericId = jid.replace(/^tg:/, '');
+      // Telegram captions are capped at 1024 chars; truncate to avoid an API error.
+      const trimmedCaption =
+        caption && caption.length > 1024 ? caption.slice(0, 1024) : caption;
+      await this.bot.api.sendPhoto(numericId, new InputFile(filePath), {
+        caption: trimmedCaption,
+      });
+      logger.info({ jid, filePath }, 'Telegram photo sent');
+    } catch (err) {
+      logger.error({ jid, filePath, err }, 'Failed to send Telegram photo');
     }
   }
 

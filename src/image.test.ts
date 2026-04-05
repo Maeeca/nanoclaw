@@ -1,0 +1,94 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import fs from 'fs';
+
+// Mock sharp so we don't depend on native bindings in unit tests.
+vi.mock('sharp', () => {
+  const mockSharp = vi.fn(() => ({
+    resize: vi.fn().mockReturnThis(),
+    jpeg: vi.fn().mockReturnThis(),
+    toBuffer: vi.fn().mockResolvedValue(Buffer.from('resized-image-data')),
+  }));
+  return { default: mockSharp };
+});
+
+vi.mock('fs');
+
+import { processImage, parseImageReferences } from './image.js';
+
+describe('image processing', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(fs.mkdirSync).mockReturnValue(undefined);
+    vi.mocked(fs.writeFileSync).mockReturnValue(undefined);
+  });
+
+  describe('processImage', () => {
+    it('resizes and saves image, returns content string with caption', async () => {
+      const buffer = Buffer.from('raw-image-data');
+      const result = await processImage(
+        buffer,
+        '/tmp/groups/test',
+        'Check this out',
+      );
+
+      expect(result).not.toBeNull();
+      expect(result!.content).toMatch(
+        /^\[Image: attachments\/img-\d+-[a-z0-9]+\.jpg\] Check this out$/,
+      );
+      expect(result!.relativePath).toMatch(
+        /^attachments\/img-\d+-[a-z0-9]+\.jpg$/,
+      );
+      expect(fs.mkdirSync).toHaveBeenCalled();
+      expect(fs.writeFileSync).toHaveBeenCalled();
+    });
+
+    it('returns content without caption when none provided', async () => {
+      const buffer = Buffer.from('raw-image-data');
+      const result = await processImage(buffer, '/tmp/groups/test', '');
+
+      expect(result).not.toBeNull();
+      expect(result!.content).toMatch(
+        /^\[Image: attachments\/img-\d+-[a-z0-9]+\.jpg\]$/,
+      );
+    });
+
+    it('returns null on empty buffer', async () => {
+      const result = await processImage(Buffer.alloc(0), '/tmp/groups/test', '');
+      expect(result).toBeNull();
+    });
+  });
+
+  describe('parseImageReferences', () => {
+    it('extracts image paths from message content', () => {
+      const messages = [
+        { content: '[Image: attachments/img-123.jpg] hello' },
+        { content: 'plain text' },
+        { content: '[Image: attachments/img-456.jpg]' },
+      ];
+      const refs = parseImageReferences(messages);
+
+      expect(refs).toEqual([
+        { relativePath: 'attachments/img-123.jpg', mediaType: 'image/jpeg' },
+        { relativePath: 'attachments/img-456.jpg', mediaType: 'image/jpeg' },
+      ]);
+    });
+
+    it('returns empty array when no images', () => {
+      const messages = [{ content: 'just text' }];
+      expect(parseImageReferences(messages)).toEqual([]);
+    });
+
+    it('handles multiple images in a single message', () => {
+      const messages = [
+        {
+          content:
+            '[Image: attachments/a.jpg] and [Image: attachments/b.jpg] two',
+        },
+      ];
+      const refs = parseImageReferences(messages);
+      expect(refs).toHaveLength(2);
+      expect(refs[0].relativePath).toBe('attachments/a.jpg');
+      expect(refs[1].relativePath).toBe('attachments/b.jpg');
+    });
+  });
+});

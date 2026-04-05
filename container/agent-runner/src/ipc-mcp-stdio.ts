@@ -14,6 +14,11 @@ import { CronExpressionParser } from 'cron-parser';
 const IPC_DIR = '/workspace/ipc';
 const MESSAGES_DIR = path.join(IPC_DIR, 'messages');
 const TASKS_DIR = path.join(IPC_DIR, 'tasks');
+const GROUP_DIR = '/workspace/group';
+const ATTACHMENTS_DIR = path.join(GROUP_DIR, 'attachments');
+
+const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
+const DEFAULT_IMAGE_MODEL = 'google/gemini-2.5-flash-image-preview';
 
 // Context from environment variables (set by the agent runner)
 const chatJid = process.env.NANOCLAW_CHAT_JID!;
@@ -499,6 +504,275 @@ Use available_groups.json to find the JID for a group. The folder name must be c
           text: `Group "${args.name}" registered. It will start receiving messages immediately.`,
         },
       ],
+    };
+  },
+);
+
+// --- Image generation via OpenRouter ---
+
+interface OpenRouterImage {
+  type?: string;
+  image_url?: { url?: string };
+}
+
+interface OpenRouterMessage {
+  role: string;
+  content?: string | Array<{ type: string; text?: string }>;
+  images?: OpenRouterImage[];
+}
+
+interface OpenRouterResponse {
+  choices?: Array<{ message?: OpenRouterMessage }>;
+  error?: { message?: string };
+}
+
+function dataUrlToBuffer(dataUrl: string): { buffer: Buffer; ext: string } {
+  // Expected form: data:image/<type>;base64,<data>
+  const match = /^data:image\/([a-zA-Z0-9+.-]+);base64,(.+)$/.exec(dataUrl);
+  if (!match) throw new Error('OpenRouter returned a non-base64 data URL');
+  const ext = match[1].toLowerCase() === 'jpeg' ? 'jpg' : match[1].toLowerCase();
+  return { buffer: Buffer.from(match[2], 'base64'), ext };
+}
+
+function loadInputImageAsDataUrl(relativePath: string): string {
+  // Only allow paths under the group's attachments directory — any path
+  // traversal ("..") or attempts to read outside the group sandbox are rejected.
+  const resolved = path.resolve(GROUP_DIR, relativePath);
+  if (!resolved.startsWith(ATTACHMENTS_DIR + path.sep)) {
+    throw new Error(`Input image must live under attachments/: ${relativePath}`);
+  }
+  if (!fs.existsSync(resolved)) {
+    throw new Error(`Input image not found: ${relativePath}`);
+  }
+  const data = fs.readFileSync(resolved).toString('base64');
+  const ext = path.extname(resolved).slice(1).toLowerCase();
+  const mime =
+    ext === 'jpg' || ext === 'jpeg'
+      ? 'image/jpeg'
+      : ext === 'png'
+        ? 'image/png'
+        : ext === 'webp'
+          ? 'image/webp'
+          : ext === 'gif'
+            ? 'image/gif'
+            : 'image/jpeg';
+  return `data:${mime};base64,${data}`;
+}
+
+server.tool(
+  'generate_image',
+  `Generate an image from a text prompt via OpenRouter. Defaults to Google's
+Nano Banana (gemini-2.5-flash-image-preview). Can also edit an existing image
+by passing input_images (paths under attachments/). Returns the relative path
+of the saved image. To actually show the image to the user, call send_image
+with the returned path afterward.`,
+  {
+    prompt: z
+      .string()
+      .describe('Text prompt describing the image (or edit instruction).'),
+    model: z
+      .string()
+      .optional()
+      .describe(
+        `OpenRouter model slug. Defaults to "${DEFAULT_IMAGE_MODEL}". Only use models that support image output.`,
+      ),
+    input_images: z
+      .array(z.string())
+      .optional()
+      .describe(
+        'Optional reference/input images. Paths relative to the group folder, must start with "attachments/". Used for image editing.',
+      ),
+  },
+  async (args) => {
+    const apiKey = process.env.OPENROUTER_API_KEY;
+    if (!apiKey) {
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: 'OPENROUTER_API_KEY is not configured on the host. Ask the user to add it to .env and restart the service.',
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    const model = args.model || DEFAULT_IMAGE_MODEL;
+
+    // Build message content — text plus any input images for editing.
+    const userContent: Array<Record<string, unknown>> = [
+      { type: 'text', text: args.prompt },
+    ];
+    try {
+      for (const imgPath of args.input_images || []) {
+        userContent.push({
+          type: 'image_url',
+          image_url: { url: loadInputImageAsDataUrl(imgPath) },
+        });
+      }
+    } catch (err) {
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: `Input image error: ${err instanceof Error ? err.message : String(err)}`,
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    let responseData: OpenRouterResponse;
+    try {
+      const resp = await fetch(OPENROUTER_URL, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+          'HTTP-Referer': 'https://github.com/qwibitai/nanoclaw',
+          'X-Title': 'NanoClaw',
+        },
+        body: JSON.stringify({
+          model,
+          modalities: ['image', 'text'],
+          messages: [{ role: 'user', content: userContent }],
+        }),
+      });
+      const text = await resp.text();
+      if (!resp.ok) {
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: `OpenRouter HTTP ${resp.status}: ${text.slice(0, 500)}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+      responseData = JSON.parse(text);
+    } catch (err) {
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: `OpenRouter request failed: ${err instanceof Error ? err.message : String(err)}`,
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    if (responseData.error) {
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: `OpenRouter error: ${responseData.error.message || 'unknown'}`,
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    const msg = responseData.choices?.[0]?.message;
+    const imageDataUrl = msg?.images?.[0]?.image_url?.url;
+    if (!imageDataUrl) {
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: `Model "${model}" did not return an image. Check that the model supports image output.`,
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    let buffer: Buffer;
+    let ext: string;
+    try {
+      ({ buffer, ext } = dataUrlToBuffer(imageDataUrl));
+    } catch (err) {
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: `Failed to decode generated image: ${err instanceof Error ? err.message : String(err)}`,
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    fs.mkdirSync(ATTACHMENTS_DIR, { recursive: true });
+    const filename = `gen-${Date.now()}-${Math.random().toString(36).slice(2, 6)}.${ext}`;
+    const fullPath = path.join(ATTACHMENTS_DIR, filename);
+    fs.writeFileSync(fullPath, buffer);
+
+    const relativePath = `attachments/${filename}`;
+    return {
+      content: [
+        {
+          type: 'text' as const,
+          text: `Image saved to ${relativePath} (${buffer.length} bytes, model=${model}). Call send_image with path="${relativePath}" to deliver it to the user.`,
+        },
+      ],
+    };
+  },
+);
+
+server.tool(
+  'send_image',
+  `Send an image from the group's attachments/ directory to the user's chat.
+Use this after generate_image (or any time you want to send an image file to
+the user). The path must live under attachments/ — no path traversal.`,
+  {
+    path: z
+      .string()
+      .describe(
+        'Relative image path under the group folder, e.g. "attachments/gen-123.png".',
+      ),
+    caption: z
+      .string()
+      .optional()
+      .describe('Optional caption text to send with the image.'),
+  },
+  async (args) => {
+    // Guard: path must be under attachments/
+    const resolved = path.resolve(GROUP_DIR, args.path);
+    if (!resolved.startsWith(ATTACHMENTS_DIR + path.sep)) {
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: `Path must be under attachments/. Got: ${args.path}`,
+          },
+        ],
+        isError: true,
+      };
+    }
+    if (!fs.existsSync(resolved)) {
+      return {
+        content: [
+          { type: 'text' as const, text: `Image not found: ${args.path}` },
+        ],
+        isError: true,
+      };
+    }
+
+    const data: Record<string, string | undefined> = {
+      type: 'send_image',
+      chatJid,
+      path: args.path,
+      caption: args.caption || undefined,
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    };
+    writeIpcFile(MESSAGES_DIR, data);
+
+    return {
+      content: [{ type: 'text' as const, text: 'Image queued for delivery.' }],
     };
   },
 );

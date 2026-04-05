@@ -6,12 +6,13 @@ import { CronExpressionParser } from 'cron-parser';
 import { DATA_DIR, IPC_POLL_INTERVAL, TIMEZONE } from './config.js';
 import { AvailableGroup } from './container-runner.js';
 import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
-import { isValidGroupFolder } from './group-folder.js';
+import { isValidGroupFolder, resolveGroupFolderPath } from './group-folder.js';
 import { logger } from './logger.js';
 import { RegisteredGroup } from './types.js';
 
 export interface IpcDeps {
   sendMessage: (jid: string, text: string) => Promise<void>;
+  sendPhoto: (jid: string, filePath: string, caption?: string) => Promise<void>;
   registeredGroups: () => Record<string, RegisteredGroup>;
   registerGroup: (jid: string, group: RegisteredGroup) => void;
   syncGroups: (force: boolean) => Promise<void>;
@@ -91,6 +92,49 @@ export function startIpcWatcher(deps: IpcDeps): void {
                     { chatJid: data.chatJid, sourceGroup },
                     'Unauthorized IPC message attempt blocked',
                   );
+                }
+              } else if (
+                data.type === 'send_image' &&
+                data.chatJid &&
+                data.path
+              ) {
+                const targetGroup = registeredGroups[data.chatJid];
+                const authorized =
+                  isMain ||
+                  (targetGroup && targetGroup.folder === sourceGroup);
+                if (!authorized) {
+                  logger.warn(
+                    { chatJid: data.chatJid, sourceGroup },
+                    'Unauthorized IPC send_image attempt blocked',
+                  );
+                } else {
+                  // Restrict to the source group's own attachments/ —
+                  // prevents reading files outside the sandbox even if
+                  // the agent tries to pass a crafted relative path.
+                  const groupDir = resolveGroupFolderPath(sourceGroup);
+                  const attachmentsDir = path.join(groupDir, 'attachments');
+                  const resolved = path.resolve(groupDir, String(data.path));
+                  if (!resolved.startsWith(attachmentsDir + path.sep)) {
+                    logger.warn(
+                      { path: data.path, sourceGroup },
+                      'send_image path escape attempt blocked',
+                    );
+                  } else if (!fs.existsSync(resolved)) {
+                    logger.warn(
+                      { path: data.path, resolved, sourceGroup },
+                      'send_image file not found',
+                    );
+                  } else {
+                    await deps.sendPhoto(
+                      data.chatJid,
+                      resolved,
+                      data.caption,
+                    );
+                    logger.info(
+                      { chatJid: data.chatJid, sourceGroup, path: data.path },
+                      'IPC image sent',
+                    );
+                  }
                 }
               }
               fs.unlinkSync(filePath);
