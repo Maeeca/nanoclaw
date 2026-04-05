@@ -100,8 +100,7 @@ export function startIpcWatcher(deps: IpcDeps): void {
               ) {
                 const targetGroup = registeredGroups[data.chatJid];
                 const authorized =
-                  isMain ||
-                  (targetGroup && targetGroup.folder === sourceGroup);
+                  isMain || (targetGroup && targetGroup.folder === sourceGroup);
                 if (!authorized) {
                   logger.warn(
                     { chatJid: data.chatJid, sourceGroup },
@@ -125,11 +124,7 @@ export function startIpcWatcher(deps: IpcDeps): void {
                       'send_image file not found',
                     );
                   } else {
-                    await deps.sendPhoto(
-                      data.chatJid,
-                      resolved,
-                      data.caption,
-                    );
+                    await deps.sendPhoto(data.chatJid, resolved, data.caption);
                     logger.info(
                       { chatJid: data.chatJid, sourceGroup, path: data.path },
                       'IPC image sent',

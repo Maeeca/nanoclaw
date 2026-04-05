@@ -99,7 +99,10 @@ export class TelegramChannel implements Channel {
       const fileUrl = `https://api.telegram.org/file/bot${this.botToken}/${file.file_path}`;
       const resp = await fetch(fileUrl);
       if (!resp.ok) {
-        logger.warn({ fileId, status: resp.status }, 'Telegram file download failed');
+        logger.warn(
+          { fileId, status: resp.status },
+          'Telegram file download failed',
+        );
         return null;
       }
 
@@ -359,7 +362,8 @@ export class TelegramChannel implements Channel {
       }
       try {
         const file = await this.bot!.api.getFile(fileId);
-        if (!file.file_path) throw new Error('no file_path in getFile response');
+        if (!file.file_path)
+          throw new Error('no file_path in getFile response');
         const fileUrl = `https://api.telegram.org/file/bot${this.botToken}/${file.file_path}`;
         const resp = await fetch(fileUrl);
         if (!resp.ok) throw new Error(`download HTTP ${resp.status}`);
