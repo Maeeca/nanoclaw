@@ -18,7 +18,7 @@ const GROUP_DIR = '/workspace/group';
 const ATTACHMENTS_DIR = path.join(GROUP_DIR, 'attachments');
 
 const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
-const DEFAULT_IMAGE_MODEL = 'google/gemini-2.5-flash-image-preview';
+const DEFAULT_IMAGE_MODEL = 'google/gemini-3.1-flash-image-preview';
 
 // Context from environment variables (set by the agent runner)
 const chatJid = process.env.NANOCLAW_CHAT_JID!;
@@ -562,7 +562,7 @@ function loadInputImageAsDataUrl(relativePath: string): string {
 server.tool(
   'generate_image',
   `Generate an image from a text prompt via OpenRouter. Defaults to Google's
-Nano Banana (gemini-2.5-flash-image-preview). Can also edit an existing image
+Nano Banana (gemini-3.1-flash-image-preview). Can also edit an existing image
 by passing input_images (paths under attachments/). Returns the relative path
 of the saved image. To actually show the image to the user, call send_image
 with the returned path afterward.`,
